@@ -48,6 +48,8 @@
 | **GELU** | $x \cdot \Phi(x)$ (smooth approximation) | $(-\infty, \infty)$ | Used in modern transformers like BERT |
 | **Swish** | $x \cdot \sigma(\beta x)$ | $(-\infty, \infty)$ | Used in some vision models |
 
+<img width="1279" height="743" alt="image" src="https://github.com/user-attachments/assets/f75fc496-ca2e-48a8-8b4b-3612e723e3b0" />
+
 **Example of ReLU**: If the input is 5, output 5; if input is –2, output 0. It's fast and simple.
 
 ### The Vanishing & Exploding Gradient Problem
@@ -1117,4 +1119,5 @@ A: Absolute embeddings (like learned position IDs) can't handle sequences longer
 ---
 
 *✅ Phase 4 Complete.
+
 
