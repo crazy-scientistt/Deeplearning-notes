@@ -1559,4 +1559,472 @@ Modern upgrades (LLaMA style):
   Pre-LN, RMSNorm, RoPE, GQA, SwiGLU, no bias
 ```
 
-✅ **Phase 4 Complete — Phase 5 bhejo!**
+✅ **Phase 4 Complete**
+
+# 🧠 Deep Learning Interview Revision Notes
+## Phase 5: LLM Inference, Optimization & Ecosystem
+
+---
+
+## 🔹 Parameter-Efficient Fine-Tuning (PEFT)
+
+**Full fine-tuning ki problem kya hai?**
+Maan lo tumhare paas 70B parameter model hai. fp16 mein sirf weights ka size hai ~140GB GPU memory. Ab fine-tuning ke liye gradients aur optimizer states bhi chahiye — Adam optimizer 2x params leta hai. Toh total ho jaata hai **~560GB+** GPU memory. Yeh 7 A100 80GB GPUs sirf optimizer states ke liye.
+
+Yeh practically impossible hai zyada tar logon ke liye.
+
+**PEFT ka idea:** Model ka zyada tar hissa freeze kar do, aur sirf ek choti si additional parameters train karo.
+
+---
+
+## 🔹 LoRA — Low-Rank Adaptation
+
+**Core idea kya hai?**
+Pre-trained weight matrix $W_0$ ko freeze kar do — touch nahi karna. Uski jagah, ek **low-rank decomposition** train karo jo weight update $\Delta W$ represent kare:
+
+$$W = W_0 + \Delta W = W_0 + BA$$
+
+Yahan $B \in \mathbb{R}^{d \times r}$ aur $A \in \mathbb{R}^{r \times k}$ hain, aur $r$ bahut chota hai — original dimension se kaafi kam.
+
+Sirf $A$ aur $B$ train hote hain:
+- $A$ randomly initialize hota hai (Gaussian)
+- $B$ zero se initialize hota hai → shuru mein $\Delta W = 0$ — matlab training original model ke behavior se start hoti hai
+
+Inference pe dono merge kar sakte ho: $W' = W_0 + BA$ — koi extra latency nahi.
+
+---
+
+**Low-rank kyun kaam karta hai?**
+Hypothesis yeh hai ke fine-tuning ke doran weight updates ki **intrinsic rank low hoti hai** — matlab meaningful adaptation ek low-dimensional subspace mein hoti hai, chahe poori weight matrix kitni bhi badi ho.
+
+Empirically prove hua hai ke sirf $r = 4$ ya $r = 8$ se bhi full fine-tuning jaisi quality milti hai downstream tasks pe.
+
+---
+
+**Parameter savings kitni hain?**
+
+- Full layer: $d \times k$ parameters update hote hain
+- LoRA: $(d \times r) + (r \times k) = r(d+k)$ parameters
+
+**Example:** $r=8$, $d=k=4096$:
+- LoRA trains: $8 \times 8192 =$ **65,536 parameters**
+- Full layer: $4096^2 =$ **16.7 million parameters**
+- Reduction: **256 guna kam!**
+
+---
+
+**LoRA kahan apply hota hai?**
+Typically attention projection matrices pe: $W_Q$, $W_K$, $W_V$, $W_O$. Kabhi kabhi FFN layers pe bhi.
+
+**LoRA rank $r$:** Main hyperparameter — zyada $r$ = zyada capacity lekin zyada parameters. Typical range: 4–64.
+
+**LoRA alpha $\alpha$:** Scaling factor — effective learning rate hoti hai $\frac{\alpha}{r}$. Aksar $\alpha = 2r$ set karte hain.
+
+---
+
+**Interview Question — LoRA kyun kaam karta hai?**
+LoRA is hypothesis pe based hai ke fine-tuning updates ki intrinsic dimensionality low hoti hai — naye task ke liye weight changes full weight space se bahut chote subspace mein hoti hain. $\Delta W = BA$ se hum updates ko is subspace tak constrain karte hain. Total parameters ka sirf ~0.1–1% train karna padta hai — lekin quality full fine-tuning ke qareeb hoti hai kyunki important signal wahi low-rank subspace mein hota hai.
+
+---
+
+## 🔹 QLoRA — Quantized LoRA
+
+**LoRA pe kya add kiya?**
+Teen cheezein:
+
+**1. 4-bit NormalFloat (NF4) quantization:**
+Frozen base model weights ko 4-bit mein compress karo — memory dramatically kam ho jaati hai. NF4 specially normally distributed weights ke liye optimize kiya gaya hai — aur pre-trained LLM weights normally distributed hote hain.
+
+Forward pass mein weights on-the-fly bf16 mein dequantize hote hain computation ke liye, phir immediately discard ho jaate hain. Base model weights kabhi update nahi hote — sirf LoRA adapters update hote hain jo bf16/fp16 mein rehte hain.
+
+**2. Double quantization:**
+Quantization constants khud bhi quantize karo — aur thoda memory bachao.
+
+**3. Paged Optimizers:**
+Jab GPU memory tight ho, optimizer states CPU RAM pe page kar do — OOM crashes rokta hai.
+
+---
+
+**Memory impact kitna hai?**
+
+- LLaMA 65B full fine-tuning: ~780GB GPU memory chahiye
+- QLoRA se LLaMA 65B: **ek single 48GB GPU** pe fit ho jaata hai
+
+Yeh academic labs aur practitioners ke liye large model fine-tuning democratize kar diya — massive GPU clusters ki zaroorat nahi.
+
+---
+
+**⚖️ Full Fine-Tuning vs LoRA vs QLoRA:**
+
+| Property | Full Fine-Tuning | LoRA | QLoRA |
+|---|---|---|---|
+| **Memory** | Sabse zyada (~5× model) | Kam (~1.2× model) | Sabse kam (~0.4× model) |
+| **Performance** | Best | Near-equivalent | Thodi degradation possible |
+| **Trainable Params** | 100% | 0.1–1% | 0.1–1% (fp16 mein) |
+| **Inference Overhead** | Koi nahi | Koi nahi (weights merge) | Dequantization step |
+| **Use Case** | Max quality, full infra | Efficient fine-tuning | Consumer/academic GPU constraints |
+
+---
+
+**Interview Question — QLoRA 65B model ek GPU pe kaise fit karta hai?**
+Teen techniques milke kaam karti hain: (1) **4-bit NF4 quantization** — 16-bit se 4-bit, memory ~4x kam. (2) **LoRA adapters** bf16 mein train hote hain quantized base ke upar — sirf tiny fraction of parameters update. (3) **Paged optimizers** — memory spikes mein optimizer states CPU RAM pe spill hote hain. Milake ek model jo 780GB chahiye tha woh ~48GB mein fit ho jaata hai — full fine-tuning se minimal quality loss ke saath.
+
+---
+
+## 🔹 Inference Bottlenecks
+
+**Do regimes hain — samjho farq:**
+
+| Regime | Bottleneck | Kab hota hai | Optimization |
+|---|---|---|---|
+| **Compute Bound** | FLOPs (arithmetic operations) | Large batches, prompt processing | Tensor parallelism, faster hardware |
+| **Memory Bandwidth Bound** | Weights load karne ki speed | Chote batches, single-token decoding | Quantization, batching |
+
+---
+
+**Decoding memory-bandwidth bound kyun hai?**
+Autoregressive generation mein ek token at a time generate hota hai. Har forward pass mein GPU ko **saare model weights** HBM se load karne padte hain — lekin FLOPs per weight bahut kam hote hain. Arithmetic intensity (FLOPs/byte) bahut low hoti hai. GPU ke massive compute cores idle baithte hain data ka wait karte hue.
+
+**Concrete example:**
+- A100 ke paas 312 TFLOPS compute hai lekin sirf 2 TB/s memory bandwidth
+- LLaMA 70B se ek token generate karne ke liye ~140GB weights load karne padte hain
+- 2 TB/s pe: ~**70ms per token** — compute speed se koi farak nahi padta
+
+---
+
+**Interview Question — Token generation memory-bandwidth bound kyun hai compute bound nahi?**
+Autoregressive decoding mein ek token at a time generate hota hai. Har forward pass mein saare model weights HBM se load karne padte hain — lekin sirf $O(d^2)$ FLOPs perform hote hain. Arithmetic intensity GPU ke compute-to-bandwidth ratio se bahut kam hoti hai. Compute cores data ka intezaar karte hain. Solutions: quantization (load karne ke bytes kam karo), batching (arithmetic intensity badhao), KV caching (redundant recomputation hatao).
+
+---
+
+## 🔹 KV Cache
+
+**Bina caching ke kya problem hai?**
+Autoregressive generation mein token $t+1$ generate karne ke liye tokens $1..t$ ka forward pass chahiye. Har layer mein attention saare tokens ke liye $K$ aur $V$ compute karta hai. Bina caching ke — tokens $1..t-1$ ke $K$ aur $V$ har step pe **recompute** hote hain — waste. Compute cost poori generation mein $O(t^2)$ ho jaati hai — context length mein quadratic.
+
+---
+
+**KV Cache solution:**
+Token $i$ ke liye $K_i$ aur $V_i$ compute karo — **cache karo aur reuse karo** future steps ke liye. Step $t$ pe sirf **naye token** ke liye $Q_t$, $K_t$, $V_t$ compute karo — baaki $K_{1..t-1}$, $V_{1..t-1}$ cache se retrieve karo.
+
+Generation cost $O(t^2)$ se **$O(t)$** ho jaati hai — linear.
+
+```
+Step 1: K₁, V₁ compute → cache
+Step 2: K₂, V₂ compute → cache; [K₁,K₂], [V₁,V₂] pe attend
+Step 3: K₃, V₃ compute → cache; [K₁,K₂,K₃], [V₁,V₂,V₃] pe attend
+...
+Step t: Sirf naye token ka K,V compute; poori history cache se
+```
+
+---
+
+**KV Cache memory cost kitni hai?**
+
+Cache size formula:
+$$2 \times L \times n_h \times d_h \times T \times \text{bytes}$$
+
+($L$ = layers, $n_h$ = attention heads, $d_h$ = head dim, $T$ = sequence length)
+
+- LLaMA 70B, context 4096, fp16: **~8GB** sirf KV cache ke liye
+- 128K context pe: **~250GB** — long contexts pe KV cache model weights se zyada memory le leta hai
+
+Isliye KV cache size reduce karna major research focus hai — GQA, MLA, sliding window attention sab isi liye bane.
+
+---
+
+**Interview Question — KV cache kya hai aur memory implications kya hain?**
+KV cache past tokens ke key aur value projections GPU memory mein store karta hai taake har generation step pe recompute na karne padein. Decoding time complexity $O(t^2)$ se $O(t)$ ho jaati hai. Lekin memory cost sequence length aur layers ke saath linearly scale karti hai — 70B model mein long contexts pe KV cache model weights se zyada memory consume kar sakta hai. Isliye GQA (K/V heads kam karta hai) aur sliding window attention (context length per layer cap karta hai) aaye.
+
+---
+
+## 🔹 FlashAttention
+
+**Standard attention ki memory problem:**
+Standard attention poori $n \times n$ attention matrix GPU HBM mein materialize karta hai.
+
+$n = 16,384$ (16K context) aur float16 pe: $16384^2 \times 2$ bytes ≈ **512MB per layer**. Yeh training ka dominant memory bottleneck hai.
+
+---
+
+**FlashAttention ka core innovation — Dao et al., 2022:**
+Poori attention matrix HBM mein **kabhi materialize mat karo**. Bajaye iske, attention **tiles** mein compute karo jo SRAM (on-chip fast cache) mein fit hon — tiling aur online softmax trick use karke.
+
+---
+
+**Kaise kaam karta hai?**
+GPU mein do memory tiers hain:
+- **HBM** — bada, slow, ~2 TB/s
+- **SRAM** — chota, fast, ~19 TB/s
+
+**Standard attention:** $Q, K, V$ HBM se parhta hai → poora $n \times n$ matrix HBM pe likhta hai → softmax ke liye wapas parhta hai → value weighting ke liye wapas parhta hai. Bahut slow HBM round trips.
+
+**FlashAttention:** $Q, K, V$ ke tiles SRAM mein load karo → partial attention results poori tarah SRAM mein compute karo → sirf final output HBM pe likho. **Bahut kam HBM accesses.**
+
+---
+
+**Results:**
+- **Memory:** $O(n^2)$ ki jagah $O(n)$ — poori attention matrix store nahi hoti
+- **Speed:** Standard attention se 2–4x faster practice mein
+- **Output:** Standard attention se mathematically identical — yeh approximation nahi hai
+- FlashAttention 2 & 3 ne sequence length pe better parallelism aur tensor core utilization add ki
+
+---
+
+**Interview Question — FlashAttention $O(n)$ memory mein same result kaise achieve karta hai?**
+FlashAttention **tiling** use karta hai — Q, K, V ko blocks mein process karta hai jo GPU SRAM mein fit hon, poora $n \times n$ matrix HBM mein materialize karne ki jagah. **Online softmax** (log-sum-exp) trick use karta hai taake normalized attention weights incrementally compute hon tiles ke across — bina saare scores ek saath memory mein rakhe. Result standard attention se mathematically identical hai, lekin sirf $O(n)$ HBM memory chahiye, $O(n^2)$ nahi. Speedup aata hai dramatically reduced expensive HBM memory reads/writes se.
+
+---
+
+## 🔹 Grouped-Query Attention (GQA)
+
+**Pehle teen options samjho:**
+
+**Multi-Head Attention (MHA):**
+$h$ heads, har ek ke paas apna $W_Q$, $W_K$, $W_V$. KV cache $h$ K/V pairs store karta hai per token per layer.
+
+**Multi-Query Attention (MQA):**
+Saare query heads ek **single K/V head** share karte hain. KV cache size $h$ guna kam ho jaati hai. Trade-off: quality hurt hoti hai — ek K/V head bahut kam capacity hai.
+
+**Grouped-Query Attention (GQA — Ainslie et al., 2023):**
+Middle ground. Queries $G$ groups mein divide hoti hain — har group ek K/V head share karti hai.
+- $G = 1$ → MQA ke equivalent
+- $G = h$ → MHA ke equivalent
+
+LLaMA 2 70B, LLaMA 3, Mistral, Gemma, Falcon — sab GQA use karte hain.
+
+```
+MHA: Q₁K₁V₁  Q₂K₂V₂  Q₃K₃V₃  Q₄K₄V₄  (4 KV heads)
+MQA: Q₁K₁V₁  Q₂K₁V₁  Q₃K₁V₁  Q₄K₁V₁  (1 KV head)
+GQA: Q₁K₁V₁  Q₂K₁V₁  Q₃K₂V₂  Q₄K₂V₂  (2 KV heads, G=2)
+```
+
+---
+
+**⚖️ MHA vs GQA vs MQA:**
+
+| Property | MHA | GQA | MQA |
+|---|---|---|---|
+| **KV Cache Size** | $h \times d_h$ | $G \times d_h$ | $d_h$ |
+| **Model Quality** | Best | Near-MHA | Degraded |
+| **Inference Speed** | Slower | Fast | Fastest |
+| **Modern Use** | Purane models | LLaMA 2/3, Mistral | Falcon, Gemini |
+
+---
+
+**Interview Question — Modern LLMs GQA kyun use karte hain standard MHA ki jagah?**
+KV cache memory K/V heads ki tadaad ke saath scale karti hai per layer — standard MHA $h$ K/V pairs store karta hai per token, jo long contexts pe dominant memory cost ban jaata hai. GQA K/V heads ko $h$ se $G$ tak reduce karta hai ($G \ll h$) lekin query heads same rakhta hai. KV cache memory $h/G$ guna cut hoti hai — minimal quality degradation ke saath (MQA ki tarah jo sirf ek K/V head use karta hai aur quality noticeably hurt karta hai). Result: faster inference, longer context support, aur higher batch sizes — production LLM serving ke liye sab critical hain.
+
+---
+
+## 🔹 RAG — Retrieval-Augmented Generation
+
+**RAG kyun chahiye?**
+LLMs mein fundamental limitations hain:
+- **Knowledge cutoff** — base model ki knowledge training time pe freeze ho jaati hai, recent events ke baare mein nahi jaanta
+- **Hallucination** — jab knowledge uncertain ho, model plausible lekin galat facts generate karta hai
+- **Context window limits** — poori knowledge base prompt mein fit nahi hoti
+- **Updateability** — model retraining expensive hai. RAG knowledge ko **retrieval time pe updatable** banata hai
+
+---
+
+**RAG Pipeline:**
+
+```
+User Query
+    ↓
+1. RETRIEVAL
+   Query → Embedding Model → Query Vector
+   Query Vector → Vector DB similarity search → Top-K relevant chunks
+    ↓
+2. AUGMENTATION
+   Relevant chunks + Original query → Augmented prompt
+    ↓
+3. GENERATION
+   Augmented prompt → LLM → Grounded response
+```
+
+---
+
+**Step 1 — Embeddings:**
+Documents ko chunks mein toddo (maslan 256–512 tokens each). Har chunk ko ek **embedding model** se paas karo — maslan `text-embedding-3-large`, `E5`, `BGE`, `Nomic-Embed`.
+
+Embedding model text ko ek dense vector mein map karta hai $\mathbb{R}^d$ mein (maslan $d = 768$ ya $1536$) jo **semantic meaning** capture karta hai. Semantically similar texts → embedding space mein nearby vectors.
+
+**Contrastive training** (InfoNCE loss) se seekhta hai — similar pairs ko paas kheencho, dissimilar pairs ko door dhakelo.
+
+---
+
+**Step 2 — Vector Databases & Similarity Search:**
+Embeddings ek **vector database** mein store hoti hain — Pinecone, Weaviate, Qdrant, Chroma, pgvector.
+
+Query time pe: user query embed karo → $k$ nearest stored vectors dhundho.
+
+**Similarity metric:**
+$$\text{sim}(q, d) = \frac{q \cdot d}{\|q\|\|d\|}$$
+
+Cosine similarity — most common. Normalized vectors pe dot product equivalent hai.
+
+---
+
+**Approximate Nearest Neighbor (ANN) Search:**
+High dimensions mein exact nearest neighbor $O(n \cdot d)$ hai — millions of documents ke liye bahut slow. ANN algorithms speed ke liye exact results trade karte hain:
+
+- **HNSW** (Hierarchical Navigable Small World) — Graph-based, fast query, high recall — sabse popular
+- **IVF** (Inverted File Index) — Vectors cluster karo, sirf nearby clusters search karo
+- **FAISS** (Facebook AI Similarity Search) — Dono implement karta hai, highly optimized
+
+---
+
+**Step 3 — Retrieval Strategies:**
+
+| Strategy | Description | Use Case |
+|---|---|---|
+| **Dense Retrieval** | Query + docs embed karo, ANN search | General semantic search |
+| **Sparse Retrieval (BM25)** | Keyword-based TF-IDF matching | Exact term matching, legal/medical |
+| **Hybrid Retrieval** | Dense + sparse scores combine karo (RRF) | Dono ka best — most robust |
+| **Re-ranking** | Cross-encoder se top-K results re-score karo | High-precision retrieval |
+
+---
+
+**Interview Question — RAG ke key failure modes kya hain aur kaise mitigate karein?**
+
+**4 main failure modes hain:**
+
+**1. Retrieval failures:** Relevant chunk retrieve nahi hota kyunki query embedding aur document embedding similar nahi hain — chahe content relevant ho (semantic gap). Fix: hybrid retrieval (BM25 + dense), query rewriting, HyDE (ek hypothetical answer generate karo, woh embed karo).
+
+**2. Chunking problems:** Answers chunk boundaries span karte hain ya chunks mein context nahi hota. Fix: sliding window chunking, sentence-aware splitting, parent-document retrieval.
+
+**3. Context faithfulness:** LLM retrieved context ignore karta hai aur phir bhi hallucinate karta hai. Fix: prompt engineering ("sirf provided context ke basis pe jawab do"), fine-tuning.
+
+**4. Stale index:** Vector DB naye documents se update nahi hua. Fix: incremental indexing pipeline.
+
+---
+
+**⚖️ RAG vs Fine-Tuning:**
+
+| Property | RAG | Fine-Tuning |
+|---|---|---|
+| **Knowledge Update** | Easy — vector DB update karo | Hard — model retrain karo |
+| **Factual Grounding** | Strong — sources cite kar sakta hai | Weaker — knowledge baked in |
+| **Latency** | Zyada (retrieval step) | Kam |
+| **Private/Dynamic Data** | Excellent | Retraining chahiye |
+| **Reasoning Style** | Unchanged | Adapt ho sakta hai |
+| **Best For** | Factual QA, dynamic knowledge | Style, tone, task format adaptation |
+
+---
+
+**Interview Question — RAG choose karo ya Fine-Tuning domain knowledge ke liye?**
+**RAG prefer karo jab:** knowledge base bada ho, frequently updated ho, ya proprietary ho; source attribution chahiye; ya retraining ka cost avoid karna ho.
+
+**Fine-Tuning prefer karo jab:** model ko differently reason karna ho — sirf zyada jaanna nahi; specific output format chahiye; ya domain knowledge stable aur compact hai.
+
+**Best practice:** **RAG + SFT/PEFT saath mein** aksar most powerful hota hai — fine-tune reasoning style aur task format ke liye, RAG dynamic factual grounding ke liye.
+
+---
+
+## 🔹 Quantization
+
+**Kyun quantize karte hain?**
+Model weight precision reduce karo: fp32 → fp16 → bf16 → int8 → int4.
+- Memory footprint chota → zyada bade models kam GPUs pe fit
+- Faster memory bandwidth — per weight load karne ke bytes kam
+
+---
+
+**Common Formats:**
+
+| Format | Bits | 70B Model Size | Quality Loss |
+|---|---|---|---|
+| fp32 | 32 | ~280 GB | Baseline |
+| fp16 / bf16 | 16 | ~140 GB | Negligible |
+| int8 (LLM.int8) | 8 | ~70 GB | Small |
+| NF4 / int4 (GGUF) | 4 | ~35 GB | Moderate |
+| 2-bit | 2 | ~17 GB | Significant |
+
+---
+
+**bf16 vs fp16 — Kya farq hai?**
+Dono 16-bit hain lekin bits differently allocate karte hain:
+- **fp16:** 5 exponent bits + 10 mantissa bits
+- **bf16:** 8 exponent bits + 7 mantissa bits — fp32 jaisi same exponent range
+
+bf16 mein wider exponent range matlab bahut bade aur chote values represent ho sakte hain bina overflow/underflow ke — training mein critical hai jab gradients extreme values le sakte hain. fp16 mein deep network training mein aksar loss spikes ya NaN values aate hain bina careful loss scaling ke. bf16 yeh problem eliminate karta hai — A100 aur H100 pe LLM training ka default hai.
+
+---
+
+**Post-Training Quantization (PTQ):**
+Training ke baad quantize karo — fast, retraining nahi chahiye. Quality very low bits pe degrade hoti hai.
+
+**Quantization-Aware Training (QAT):**
+Training ke doran quantization simulate karo — better quality, lekin training access chahiye.
+
+---
+
+## 🗺️ Phase 5 — Complete Summary
+
+```
+PEFT:
+  LoRA  → Low-rank ΔW = BA; frozen base; inference pe merge
+  QLoRA → 4-bit base + LoRA adapters; 70B ek GPU pe
+
+Inference Bottlenecks:
+  Decoding memory-bandwidth bound hai
+  KV Cache → O(t²) se O(t); memory L × h × T ke saath scale
+
+Attention Optimizations:
+  FlashAttention → Tiling; O(n) memory; IO-aware; exact output
+  GQA           → Shared K/V across query groups; KV cache cut
+
+RAG:
+  Embed → Vector DB (HNSW/FAISS) → ANN search → Augment → Generate
+  Failure modes: retrieval gap, chunking, faithfulness, stale index
+  RAG vs Fine-Tuning: dynamic knowledge vs reasoning style
+
+Quantization:
+  fp32 → bf16 → int8 → NF4 (4-bit)
+  bf16 training ke liye preferred; NF4 QLoRA inference ke liye
+```
+
+---
+
+## 🎯 Final Interview Readiness Checklist
+
+### Phase 1 — Neural Network Foundations
+- [ ] Vanishing gradients explain karo aur 3 mitigations
+- [ ] ReLU vs GELU contrast karo — kab kaunsa
+- [ ] AdamW Adam se better kyun hai LLMs ke liye
+- [ ] LayerNorm Transformers mein BatchNorm se kyun preferred hai
+
+### Phase 2 — Specialized Architectures
+- [ ] ResNet skip connection aur degradation problem explain karo
+- [ ] CNN output size formula derive karo
+- [ ] Vanilla RNNs long sequences pe kyun fail karte hain
+- [ ] LSTM cell state gradient highway explain karo
+
+### Phase 3 — Attention & Transformers
+- [ ] $\sqrt{d_k}$ scaling ka intuition derive karo
+- [ ] Q, K, V library analogy se explain karo
+- [ ] Encoder vs decoder blocks contrast karo
+- [ ] RoPE vs sinusoidal encoding explain karo
+- [ ] Causal masking training mein kyun zaroori hai
+
+### Phase 4 — LLMs
+- [ ] 3 reasons dو decoder-only kyun jeeta
+- [ ] RLHF pipeline 3 steps mein describe karo
+- [ ] Reward hacking aur KL penalty explain karo
+- [ ] DPO vs RLHF 5 dimensions pe contrast karo
+- [ ] SwiGLU, Pre-RMSNorm explain karo aur kyun use karte hain
+
+### Phase 5 — Inference & Ecosystem
+- [ ] LoRA ka low-rank assumption aur parameter savings explain karo
+- [ ] Decoding memory-bandwidth bound kyun hai
+- [ ] KV cache — kya store karta hai, kyun help karta hai, memory cost
+- [ ] FlashAttention tiling aur kyun exact hai approximate nahi
+- [ ] GQA vs MHA vs MQA trade-offs
+- [ ] RAG pipeline end-to-end describe karo aur failure modes
+- [ ] RAG vs fine-tuning domain adaptation ke liye contrast karo
+
+---
+
+✅ **5 Phases Complete — Tum ready ho. Best of luck! 🚀*
